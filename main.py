@@ -1,113 +1,109 @@
 import os
 import asyncio
+import re
 import time
-from pyrogram import Client, filters, errors
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, FloodWait
+from flask import Flask
+from threading import Thread
+from pyrogram import Client, filters
+from pyrogram.errors import FloodWait, MessageIdInvalid
 
-# الإعدادات
+# --- إعدادات Flask لتجنب إغلاق السيرفر في Render/HuggingFace ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "البوت يعمل بنجاح! المطور: هيثم محمود الجمال"
+
+def run_flask():
+    # Render و Hugging Face يستخدمان منفذ متغير، غالباً 10000 أو 7860
+    port = int(os.environ.get("PORT", 7860))
+    web_app.run(host="0.0.0.0", port=port)
+
+# --- إعدادات التليجرام (جلب البيانات من Secrets) ---
 API_ID = int(os.environ.get("API_ID", "12345"))
 API_HASH = os.environ.get("API_HASH", "your_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
+SESSION_STRING = os.environ.get("SESSION_STRING")
 
-# بوت التحكم (Bot API)
-bot = Client("ControlBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+class DeepSearchBot:
+    def __init__(self):
+        self.bot = Client("ControlBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+        # حساب المستخدم للبحث الشامل (Global Search)
+        self.user = Client("UserSearch", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# متغيرات مؤقتة للجلسة
-user_sessions = {} 
+    def clean_query(self, query):
+        # تنظيف الكلمات الطويلة لزيادة دقة نتائج تليجرام
+        words = re.findall(r'\w+', query)
+        return " ".join(words[:4]) if len(words) > 4 else query
 
-# دالة شريط التقدم (Progress Bar)
-async def progress(current, total, message, start_time, action):
-    now = time.time()
-    diff = now - start_time
-    if round(diff % 4) == 0 or current == total:
-        percentage = current * 100 / total
-        speed = current / diff if diff > 0 else 0
-        time_to_completion = round((total - current) / speed) if speed > 0 else 0
-        
-        progress_str = "[{0}{1}]".format(
-            '●' * int(percentage / 10),
-            '○' * (10 - int(percentage / 10))
-        )
-        
-        tmp = f"{action}...\n\n{progress_str} {percentage:.2f}%\n" \
-              f"المنجز: {current} / {total} بابت\n" \
-              f"السرعة: {speed:.2f} B/s\n" \
-              f"الوقت المتبقي: {time_to_completion} ثانية"
-        
-        try:
-            await message.edit_text(tmp)
-        except:
-            pass
-
-@bot.on_message(filters.command("start"))
-async def start(client, message):
-    welcome = f"مرحباً بك.. أنا بوت البحث الشامل الخاص بالمطور **هيثم محمود الجمال**.\n\n" \
-              f"لتفعيل البحث الشامل، أرسل رقم هاتفك مع رمز الدولة (مثال: +967770000000)"
-    await message.reply_text(welcome)
-
-@bot.on_message(filters.text & filters.private)
-async def handle_logic(client, message):
-    chat_id = message.chat.id
-    text = message.text
-
-    # المرحلة 1: استقبال رقم الهاتف
-    if text.startswith("+") and chat_id not in user_sessions:
-        user_sessions[chat_id] = {"phone": text, "client": Client(":memory:", API_ID, API_HASH)}
-        await user_sessions[chat_id]["client"].connect()
-        try:
-            code_info = await user_sessions[chat_id]["client"].send_code(text)
-            user_sessions[chat_id]["hash"] = code_info.phone_code_hash
-            await message.reply_text("تم إرسال كود التحقق إلى حسابك، يرجى إرساله هنا:")
-        except Exception as e:
-            await message.reply_text(f"خطأ: {e}")
-        return
-
-    # المرحلة 2: استقبال كود التحقق وتوليد الجلسة
-    if chat_id in user_sessions and "hash" in user_sessions[chat_id] and "user_client" not in user_sessions[chat_id]:
-        try:
-            user_client = user_sessions[chat_id]["client"]
-            await user_client.sign_in(user_sessions[chat_id]["phone"], user_sessions[chat_id]["hash"], text)
-            
-            # حفظ الجلسة في المتغير
-            session_str = await user_client.export_session_string()
-            user_sessions[chat_id]["user_client"] = user_client
-            await message.reply_text(f"✅ تم تسجيل الدخول بنجاح!\nكود الجلسة الخاص بك (احفظه):\n`{session_str}`\n\nالآن أرسل اسم أي ملف للبحث عنه عالمياً.")
-        except Exception as e:
-            await message.reply_text(f"فشل التحقق: {e}")
-        return
-
-    # المرحلة 3: البحث الشامل (Global Search)
-    if chat_id in user_sessions and "user_client" in user_sessions[chat_id]:
-        query = text
-        user_app = user_sessions[chat_id]["user_client"]
-        waiting = await message.reply_text(f"جاري البحث عن **{query}** في تليجرام كامل... 🔍")
-        
-        count = 0
-        async for msg in user_app.search_global(query, limit=15):
-            if msg.document or msg.video or msg.audio:
-                count += 1
-                # جلب رابط الرسالة الأصلي
-                link = f"https://t.me/c/{str(msg.chat.id)[4:]}/{msg.id}" if msg.chat.username is None else msg.link
-                
-                start_time = time.time()
-                # إرسال الملف مع شريط التقدم
-                file_msg = await message.reply_text(f"جاري جلب الملف رقم {count}...")
-                
-                try:
-                    await msg.copy(
-                        chat_id=message.chat.id,
-                        caption=f"✅ تم العثور على الملف\n🔗 رابط المصدر: {link}\n\nبواسطة: هيثم الجمال",
-                        progress=progress,
-                        progress_args=(file_msg, start_time, "يتم الآن النقل")
-                    )
-                    await file_msg.delete()
-                except Exception as e:
-                    await file_msg.edit_text(f"تعذر إرسال هذا الملف: {e}")
-
-        if count == 0:
-            await waiting.edit_text("لم يتم العثور على نتائج.")
+    async def start_clients(self):
+        await self.bot.start()
+        print("✅ Bot Client Started")
+        if SESSION_STRING:
+            await self.user.start()
+            print("✅ User Client Started (Global Search Active)")
         else:
-            await waiting.delete()
+            print("⚠️ SESSION_STRING missing! Global search disabled.")
 
-print("البوت يعمل الآن يا هيثم...")
-bot.run()
+    async def run(self):
+        await self.start_clients()
+
+        @self.bot.on_message(filters.command("start") & filters.private)
+        async def start_msg(client, message):
+            await message.reply_text(
+                f"أهلاً بك.. أنا بوت البحث العميق الخاص بالمطور **هيثم محمود الجمال**.\n\n"
+                f"🔍 أرسل اسم أي ملف (فيديو، كتاب، تطبيق) وسأبحث عنه في كل قنوات تليجرام العامة."
+            )
+
+        @self.bot.on_message(filters.text & filters.private)
+        async def search_handler(client, message):
+            query = message.text
+            search_text = self.clean_query(query)
+            waiting = await message.reply_text(f"🔍 جاري البحث العميق عن: **{search_text}**...")
+            
+            count = 0
+            found_ids = set()
+
+            try:
+                # محرك البحث الشامل عبر حساب المستخدم
+                async for msg in self.user.search_global(search_text, limit=30):
+                    if msg.media and msg.id not in found_ids:
+                        found_ids.add(msg.id)
+                        count += 1
+                        
+                        # جلب الرابط الأصلي للملف
+                        link = msg.link if msg.link else f"https://t.me/c/{str(msg.chat.id)[4:]}/{msg.id}"
+                        caption = f"✅ نتيجة رقم {count}\n🔗 الرابط: {link}\n\nالمطور: هيثم الجمال"
+
+                        try:
+                            # محاولة إرسال الملف مباشرة
+                            await msg.copy(chat_id=message.chat.id, caption=caption)
+                        except Exception:
+                            # إذا فشل الإرسال (حماية محتوى) نرسل الرابط
+                            await message.reply_text(f"⚠️ الملف {count} محمي من النسخ.\n🔗 يمكنك تحميله من الرابط:\n{link}")
+                        
+                        if count >= 15: break # حد أقصى للنتائج لمنع الحظر
+
+                if count == 0:
+                    await waiting.edit_text("❌ لم يتم العثور على نتائج مشابهة. جرب اسماً أبسط.")
+                else:
+                    await waiting.delete()
+
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                await waiting.edit_text(f"حدث خطأ أثناء البحث: {str(e)}")
+
+        # إبقاء البوت يعمل
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    # 1. تشغيل سيرفر الويب في خيط منفصل لتجنب Port Timeout
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+    
+    # 2. تشغيل محرك البحث
+    bot_engine = DeepSearchBot()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(bot_engine.run())
